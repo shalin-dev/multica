@@ -118,9 +118,14 @@ Canonical core events should carry these properties whenever the entity exists:
 | `is_demo` | bool | Currently always `false`; reserved for future demo/test workspace filtering. |
 
 Task terminal events additionally carry `duration_ms`; failures carry
-`failure_reason`, `error_type`, and `recoverable`. Runtime ready/failure
-events additionally carry `runtime_id`, `ready_duration_ms` when applicable,
-and `daemon_id` for local runtimes.
+`failure_reason`, `error_type`, and `will_retry`. Runtime failure events carry
+`recoverable`; runtime ready events carry `runtime_id`, `ready_duration_ms`
+only when it is actually measured, and `daemon_id` for local runtimes.
+
+Schema v2 is the first canonical core-metrics schema. It replaces early v1
+drafts that mirrored `failure_reason` into `error_type`, used `recoverable`
+for task/autopilot failures, and emitted `ready_duration_ms: 0` before the
+registration path had a measured duration.
 
 ## Event contract
 
@@ -189,15 +194,16 @@ proof of readiness.
 |---|---|---|
 | `runtime_id` | string (UUID) | The `agent_runtime` row id. |
 | `daemon_id` | string | Local daemon identity when available. |
-| `ready_duration_ms` | int64 | Time from registration start to ready. Currently `0` for the in-process registration path. |
+| `ready_duration_ms` | int64 | Optional. Time from registration start to ready; omitted until the registration path can measure it. |
 | `runtime_mode` | string | `local` / `cloud`. |
 | `provider` | string | Runtime provider. |
 
 ### `runtime_failed`
 
 Fires when runtime setup/registration fails before a ready runtime can be
-recorded. Today this covers backend registration failures; future setup flows
-should reuse it for provider detection or daemon boot failures.
+recorded. Today this is scoped to backend registration persistence failures;
+future setup flows should reuse it for provider detection or daemon boot
+failures.
 
 | Property | Type | Description |
 |---|---|---|
@@ -263,8 +269,8 @@ Terminal task lifecycle events. They use the same join fields as
 | Property | Type | Description |
 |---|---|---|
 | `failure_reason` | string | Stable reason from `agent_task_queue.failure_reason`, default `agent_error`. |
-| `error_type` | string | Same classifier as `failure_reason` for v2; split later only if needed. |
-| `recoverable` | bool | Whether the backend auto-retry policy considers the failure retryable. |
+| `error_type` | string | Stable coarse classifier, e.g. `runtime`, `timeout`, `agent_output`, `cancelled`, `agent_error`. |
+| `will_retry` | bool | Whether the backend auto-retry policy will create another task attempt. |
 
 ### `autopilot_run_started` / `autopilot_run_completed` / `autopilot_run_failed`
 
@@ -280,6 +286,8 @@ Fires from `autopilot_run` lifecycle changes. `source` is always
 | `trigger_source` | string | `manual`, `schedule`, `webhook`, or `api`. |
 | `duration_ms` | int64 | Terminal events only. |
 | `failure_reason` | string | Failed events only. |
+| `error_type` | string | Failed events only; stable coarse classifier such as `configuration`, `issue_deleted`, `dispatch_error`, `task_error`, or `autopilot_error`. |
+| `will_retry` | bool | Failed events only; currently `false` because autopilot retry cadence is owned by triggers/schedules. |
 
 ### `issue_executed`
 

@@ -168,15 +168,18 @@ func RuntimeReady(ownerID, workspaceID, runtimeID, daemonID, provider string, re
 	if distinct == "" {
 		distinct = "workspace:" + workspaceID
 	}
+	props := map[string]any{
+		"runtime_id": runtimeID,
+		"daemon_id":  daemonID,
+	}
+	if readyDurationMS > 0 {
+		props["ready_duration_ms"] = readyDurationMS
+	}
 	return Event{
 		Name:        EventRuntimeReady,
 		DistinctID:  distinct,
 		WorkspaceID: workspaceID,
-		Properties: withCoreProperties(map[string]any{
-			"runtime_id":        runtimeID,
-			"daemon_id":         daemonID,
-			"ready_duration_ms": readyDurationMS,
-		}, CoreProperties{
+		Properties: withCoreProperties(props, CoreProperties{
 			UserID:      ownerID,
 			WorkspaceID: workspaceID,
 			Source:      SourceManual,
@@ -314,12 +317,12 @@ func AgentTaskCompleted(ctx TaskContext, durationMS int64) Event {
 	})
 }
 
-func AgentTaskFailed(ctx TaskContext, durationMS int64, failureReason, errorType string, recoverable bool) Event {
+func AgentTaskFailed(ctx TaskContext, durationMS int64, failureReason, errorType string, willRetry bool) Event {
 	return agentTaskEvent(EventAgentTaskFailed, ctx, map[string]any{
 		"duration_ms":    durationMS,
 		"failure_reason": failureReason,
 		"error_type":     errorType,
-		"recoverable":    recoverable,
+		"will_retry":     willRetry,
 	})
 }
 
@@ -339,12 +342,12 @@ func AutopilotRunCompleted(actorID, workspaceID, autopilotID, runID, agentID, tr
 	})
 }
 
-func AutopilotRunFailed(actorID, workspaceID, autopilotID, runID, agentID, triggerSource, failureReason, errorType string, recoverable bool, durationMS int64) Event {
+func AutopilotRunFailed(actorID, workspaceID, autopilotID, runID, agentID, triggerSource, failureReason, errorType string, willRetry bool, durationMS int64) Event {
 	return autopilotRunEvent(EventAutopilotRunFailed, actorID, workspaceID, autopilotID, runID, agentID, triggerSource, map[string]any{
 		"duration_ms":    durationMS,
 		"failure_reason": failureReason,
 		"error_type":     errorType,
-		"recoverable":    recoverable,
+		"will_retry":     willRetry,
 	})
 }
 
@@ -605,6 +608,7 @@ func distinctID(userID, workspaceID, agentID string) string {
 	if userID != "" {
 		return userID
 	}
+	// Synthetic PostHog distinct IDs are namespace-prefixed; user UUIDs are not.
 	if agentID != "" {
 		return "agent:" + agentID
 	}

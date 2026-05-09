@@ -89,7 +89,7 @@ WHERE id = $1;
 -- sweeper uses this as a candidate set, then optionally filters via the
 -- LivenessStore before flipping rows to offline (a fresh Redis liveness
 -- record means the DB row is just lagging, not actually dead).
-SELECT id, workspace_id FROM agent_runtime
+SELECT id, workspace_id, owner_id, daemon_id, provider FROM agent_runtime
 WHERE status = 'online'
   AND last_seen_at < now() - make_interval(secs => @stale_seconds::double precision);
 
@@ -110,7 +110,7 @@ SET status = 'offline', updated_at = now()
 WHERE status = 'online'
   AND id = ANY(@ids::uuid[])
   AND last_seen_at < now() - make_interval(secs => @stale_seconds::double precision)
-RETURNING id, workspace_id;
+RETURNING id, workspace_id, owner_id, daemon_id, provider;
 
 -- name: FailTasksForOfflineRuntimes :many
 -- Marks dispatched/running tasks as failed when their runtime is offline.

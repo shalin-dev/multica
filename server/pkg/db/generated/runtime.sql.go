@@ -381,7 +381,7 @@ SET status = 'offline', updated_at = now()
 WHERE status = 'online'
   AND id = ANY($1::uuid[])
   AND last_seen_at < now() - make_interval(secs => $2::double precision)
-RETURNING id, workspace_id
+RETURNING id, workspace_id, owner_id, daemon_id, provider
 `
 
 type MarkRuntimesOfflineByIDsParams struct {
@@ -392,6 +392,9 @@ type MarkRuntimesOfflineByIDsParams struct {
 type MarkRuntimesOfflineByIDsRow struct {
 	ID          pgtype.UUID `json:"id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	OwnerID     pgtype.UUID `json:"owner_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+	Provider    string      `json:"provider"`
 }
 
 // Flips a known set of runtime IDs from online to offline. Paired with
@@ -414,7 +417,13 @@ func (q *Queries) MarkRuntimesOfflineByIDs(ctx context.Context, arg MarkRuntimes
 	items := []MarkRuntimesOfflineByIDsRow{}
 	for rows.Next() {
 		var i MarkRuntimesOfflineByIDsRow
-		if err := rows.Scan(&i.ID, &i.WorkspaceID); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.OwnerID,
+			&i.DaemonID,
+			&i.Provider,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -488,7 +497,7 @@ func (q *Queries) RecordRuntimeLegacyDaemonID(ctx context.Context, arg RecordRun
 }
 
 const selectStaleOnlineRuntimes = `-- name: SelectStaleOnlineRuntimes :many
-SELECT id, workspace_id FROM agent_runtime
+SELECT id, workspace_id, owner_id, daemon_id, provider FROM agent_runtime
 WHERE status = 'online'
   AND last_seen_at < now() - make_interval(secs => $1::double precision)
 `
@@ -496,6 +505,9 @@ WHERE status = 'online'
 type SelectStaleOnlineRuntimesRow struct {
 	ID          pgtype.UUID `json:"id"`
 	WorkspaceID pgtype.UUID `json:"workspace_id"`
+	OwnerID     pgtype.UUID `json:"owner_id"`
+	DaemonID    pgtype.Text `json:"daemon_id"`
+	Provider    string      `json:"provider"`
 }
 
 // Lists online runtimes whose last_seen_at exceeds the stale window. The
@@ -511,7 +523,13 @@ func (q *Queries) SelectStaleOnlineRuntimes(ctx context.Context, staleSeconds fl
 	items := []SelectStaleOnlineRuntimesRow{}
 	for rows.Next() {
 		var i SelectStaleOnlineRuntimesRow
-		if err := rows.Scan(&i.ID, &i.WorkspaceID); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.WorkspaceID,
+			&i.OwnerID,
+			&i.DaemonID,
+			&i.Provider,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

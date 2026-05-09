@@ -407,10 +407,25 @@ func (s *AutopilotService) captureAutopilotRunFailed(ap db.Autopilot, run db.Aut
 		util.UUIDToString(ap.AssigneeID),
 		triggerSource,
 		reason,
-		reason,
+		autopilotErrorType(reason),
 		false,
 		autopilotRunDurationMS(run),
 	))
+}
+
+func autopilotErrorType(reason string) string {
+	switch {
+	case strings.Contains(reason, "unknown execution_mode"):
+		return "configuration"
+	case strings.Contains(reason, "linked issue") && strings.Contains(reason, "deleted"):
+		return "issue_deleted"
+	case strings.Contains(reason, "create issue"), strings.Contains(reason, "enqueue task"), strings.Contains(reason, "dispatch"):
+		return "dispatch_error"
+	case strings.HasPrefix(reason, "task "):
+		return "task_error"
+	default:
+		return "autopilot_error"
+	}
 }
 
 func autopilotActorID(ap db.Autopilot) string {

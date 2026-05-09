@@ -99,15 +99,13 @@ func sweepStaleRuntimes(ctx context.Context, queries *db.Queries, liveness handl
 	}
 	if taskSvc != nil && taskSvc.Analytics != nil {
 		for _, row := range staleRows {
-			if rt, err := queries.GetAgentRuntime(ctx, row.ID); err == nil {
-				taskSvc.Analytics.Capture(analytics.RuntimeOffline(
-					util.UUIDToString(rt.OwnerID),
-					util.UUIDToString(rt.WorkspaceID),
-					util.UUIDToString(rt.ID),
-					rt.DaemonID.String,
-					rt.Provider,
-				))
-			}
+			taskSvc.Analytics.Capture(analytics.RuntimeOffline(
+				util.UUIDToString(row.OwnerID),
+				util.UUIDToString(row.WorkspaceID),
+				util.UUIDToString(row.ID),
+				row.DaemonID.String,
+				row.Provider,
+			))
 		}
 	}
 

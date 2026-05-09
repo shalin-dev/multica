@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -36,6 +36,10 @@ type TaskService struct {
 	// goes through the DB. Wired in router.go from the shared Redis
 	// client.
 	EmptyClaim *EmptyClaimCache
+
+	analyticsContextMu    sync.Mutex
+	analyticsContextCache map[string]analytics.TaskContext
+	analyticsContextOrder []string
 }
 
 type TaskWakeupNotifier interface {
@@ -72,6 +76,8 @@ func truncateForSummary(s string, maxRunes int) string {
 	}
 	return string(rs[:maxRunes]) + "…"
 }
+
+const taskAnalyticsContextCacheMax = 4096
 
 // buildCommentTriggerSummary fetches the comment content and truncates
 // it for storage on the task row. Returns an invalid pgtype.Text when
@@ -125,8 +131,8 @@ func (s *TaskService) captureTaskFailed(ctx context.Context, task db.AgentTaskQu
 		s.taskAnalyticsContext(ctx, task),
 		taskDurationMS(task),
 		failureReason,
-		failureReason,
-		s.isFailureRecoverable(task),
+		taskErrorType(failureReason),
+		s.willRetryTask(task),
 	))
 }
 
@@ -147,7 +153,62 @@ func (s *TaskService) captureTaskEvent(ctx context.Context, event analytics.Even
 	s.Analytics.Capture(event)
 }
 
+func (s *TaskService) cachedTaskAnalyticsContext(task db.AgentTaskQueue) (analytics.TaskContext, bool) {
+	key := taskAnalyticsContextKey(task)
+	if key == "" {
+		return analytics.TaskContext{}, false
+	}
+	s.analyticsContextMu.Lock()
+	defer s.analyticsContextMu.Unlock()
+	if s.analyticsContextCache == nil {
+		return analytics.TaskContext{}, false
+	}
+	tc, ok := s.analyticsContextCache[key]
+	return tc, ok
+}
+
+func (s *TaskService) storeTaskAnalyticsContext(task db.AgentTaskQueue, tc analytics.TaskContext) {
+	if tc.WorkspaceID == "" {
+		return
+	}
+	key := taskAnalyticsContextKey(task)
+	if key == "" {
+		return
+	}
+	s.analyticsContextMu.Lock()
+	defer s.analyticsContextMu.Unlock()
+	if s.analyticsContextCache == nil {
+		s.analyticsContextCache = make(map[string]analytics.TaskContext)
+	}
+	if _, ok := s.analyticsContextCache[key]; !ok {
+		s.analyticsContextOrder = append(s.analyticsContextOrder, key)
+		if len(s.analyticsContextOrder) > taskAnalyticsContextCacheMax {
+			oldest := s.analyticsContextOrder[0]
+			s.analyticsContextOrder = s.analyticsContextOrder[1:]
+			delete(s.analyticsContextCache, oldest)
+		}
+	}
+	s.analyticsContextCache[key] = tc
+}
+
+func taskAnalyticsContextKey(task db.AgentTaskQueue) string {
+	taskID := util.UUIDToString(task.ID)
+	if taskID == "" {
+		return ""
+	}
+	return strings.Join([]string{
+		taskID,
+		util.UUIDToString(task.RuntimeID),
+		util.UUIDToString(task.IssueID),
+		util.UUIDToString(task.ChatSessionID),
+		util.UUIDToString(task.AutopilotRunID),
+	}, "|")
+}
+
 func (s *TaskService) taskAnalyticsContext(ctx context.Context, task db.AgentTaskQueue) analytics.TaskContext {
+	if tc, ok := s.cachedTaskAnalyticsContext(task); ok {
+		return tc
+	}
 	tc := analytics.TaskContext{
 		AgentID: util.UUIDToString(task.AgentID),
 		TaskID:  util.UUIDToString(task.ID),
@@ -225,6 +286,7 @@ func (s *TaskService) taskAnalyticsContext(ctx context.Context, task db.AgentTas
 		tc.UserID = qc.RequesterID
 		tc.Source = analytics.SourceManual
 	}
+	s.storeTaskAnalyticsContext(task, tc)
 	return tc
 }
 
@@ -255,7 +317,22 @@ func taskFailureReason(task db.AgentTaskQueue) string {
 	return "agent_error"
 }
 
-func (s *TaskService) isFailureRecoverable(task db.AgentTaskQueue) bool {
+func taskErrorType(reason string) string {
+	switch reason {
+	case "runtime_offline", "runtime_recovery":
+		return "runtime"
+	case "timeout":
+		return "timeout"
+	case "iteration_limit", "agent_fallback_message":
+		return "agent_output"
+	case "cancelled", "user_cancelled":
+		return "cancelled"
+	default:
+		return "agent_error"
+	}
+}
+
+func (s *TaskService) willRetryTask(task db.AgentTaskQueue) bool {
 	reason := taskFailureReason(task)
 	if !retryableReasons[reason] {
 		return false
