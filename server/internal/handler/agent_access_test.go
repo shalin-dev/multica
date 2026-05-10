@@ -225,6 +225,51 @@ func TestListAgentTasks_PrivateAgentForbidsPlainMember(t *testing.T) {
 	}
 }
 
+// TestCreateIssue_AssignToPrivateAgentForbidsPlainMember verifies that the
+// issue-assignment surface is gated by the same predicate. Without this gate
+// a plain workspace member could side-step chat/@-mention by assigning a
+// private agent to an issue and letting normal task dispatch run it.
+func TestCreateIssue_AssignToPrivateAgentForbidsPlainMember(t *testing.T) {
+	if testHandler == nil {
+		t.Skip("database not available")
+	}
+
+	agentID, ownerID, memberID := privateAgentTestFixture(t)
+
+	body := func(actorID string) map[string]any {
+		return map[string]any{
+			"title":         "assign-to-private-agent test " + actorID,
+			"status":        "todo",
+			"priority":      "medium",
+			"assignee_type": "agent",
+			"assignee_id":   agentID,
+		}
+	}
+
+	// Workspace owner (testUserID): allowed.
+	w := httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequest("POST", "/api/issues?workspace_id="+testWorkspaceID, body(testUserID)))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue as workspace owner: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Agent owner (plain member who happens to own the agent): allowed.
+	w = httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequestAs(ownerID, "POST", "/api/issues?workspace_id="+testWorkspaceID, body(ownerID)))
+	if w.Code != http.StatusCreated {
+		t.Fatalf("CreateIssue as agent owner: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Plain member: denied with 403 — closes the back door where issue
+	// assignment would otherwise hand the agent a task without going
+	// through chat / @-mention.
+	w = httptest.NewRecorder()
+	testHandler.CreateIssue(w, newRequestAs(memberID, "POST", "/api/issues?workspace_id="+testWorkspaceID, body(memberID)))
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("CreateIssue as plain member: expected 403, got %d: %s", w.Code, w.Body.String())
+	}
+}
+
 // TestCreateChatSession_PrivateAgentForbidsPlainMember verifies that members
 // who can't access the private agent cannot start a chat session against it.
 // The chat handler reads workspace context from middleware, so we set it
