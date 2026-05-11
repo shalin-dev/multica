@@ -1,6 +1,12 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
+import { useCustomPricingStore } from "@multica/core/runtimes/custom-pricing-store";
 
 import { collectUnmappedModels, estimateCost, isModelPriced } from "./utils";
+
+afterEach(() => {
+  // Reset overrides so tests don't bleed pricing state into one another.
+  useCustomPricingStore.setState({ pricings: {} });
+});
 
 const zeroUsage = {
   input_tokens: 0,
@@ -128,5 +134,73 @@ describe("collectUnmappedModels", () => {
       { ...zeroUsage, model: "fictional-model-x" },
     ];
     expect(collectUnmappedModels(rows)).toEqual(["fictional-model-x"]);
+  });
+});
+
+describe("user-supplied custom pricing", () => {
+  it("prices a model the maintained catalog doesn't ship", () => {
+    useCustomPricingStore.getState().setCustomPricing("gpt-5.5-mini", {
+      input: 1,
+      output: 4,
+      cacheRead: 0.1,
+      cacheWrite: 1,
+    });
+    expect(isModelPriced("gpt-5.5-mini")).toBe(true);
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "gpt-5.5-mini",
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+      }),
+    ).toBeCloseTo(5, 5);
+  });
+
+  it("does NOT shadow the maintained catalog when both define the same model", () => {
+    // Catalog wins so a user can't accidentally over-charge themselves for
+    // a model we already track (and so a stale local override doesn't
+    // silently disagree with what the dashboard shows everyone else).
+    useCustomPricingStore.getState().setCustomPricing("claude-sonnet-4-6", {
+      input: 999,
+      output: 999,
+      cacheRead: 999,
+      cacheWrite: 999,
+    });
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "claude-sonnet-4-6",
+        input_tokens: 1_000_000,
+      }),
+    ).toBeCloseTo(3, 5); // maintained input rate, not the 999 override
+  });
+
+  it("falls back to a stripped dated snapshot in the custom store", () => {
+    useCustomPricingStore.getState().setCustomPricing("brand-new-model", {
+      input: 2,
+      output: 8,
+      cacheRead: 0.2,
+      cacheWrite: 2,
+    });
+    expect(
+      estimateCost({
+        ...zeroUsage,
+        model: "brand-new-model-2026-04-01",
+        input_tokens: 1_000_000,
+      }),
+    ).toBeCloseTo(2, 5);
+  });
+
+  it("removeCustomPricing clears the override", () => {
+    const store = useCustomPricingStore.getState();
+    store.setCustomPricing("gpt-5.5-mini", {
+      input: 1,
+      output: 4,
+      cacheRead: 0.1,
+      cacheWrite: 1,
+    });
+    expect(isModelPriced("gpt-5.5-mini")).toBe(true);
+    useCustomPricingStore.getState().removeCustomPricing("gpt-5.5-mini");
+    expect(isModelPriced("gpt-5.5-mini")).toBe(false);
   });
 });

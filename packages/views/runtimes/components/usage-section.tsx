@@ -4,6 +4,7 @@ import { useMemo, useState } from "react";
 import { BarChart3, ChevronRight } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { Skeleton } from "@multica/ui/components/ui/skeleton";
+import { Button } from "@multica/ui/components/ui/button";
 import { useWorkspaceId } from "@multica/core/hooks";
 import { agentListOptions } from "@multica/core/workspace/queries";
 import type { RuntimeUsage } from "@multica/core/types";
@@ -12,6 +13,7 @@ import {
   runtimeUsageByAgentOptions,
   runtimeUsageByHourOptions,
 } from "@multica/core/runtimes/queries";
+import { useCustomPricingStore } from "@multica/core/runtimes/custom-pricing-store";
 import {
   formatTokens,
   estimateCost,
@@ -31,6 +33,7 @@ import {
   HourlyActivityChart,
   ActivityHeatmap,
 } from "./charts";
+import { CustomPricingDialog } from "./custom-pricing-dialog";
 import { useT } from "../../i18n";
 
 // Single source of truth for the period selector. KPIs, the When-chart, the
@@ -108,6 +111,9 @@ export function UsageSection({ runtimeId }: { runtimeId: string }) {
     runtimeUsageOptions(runtimeId, 180),
   );
   const [days, setDays] = useState<TimeRange>(30);
+  // Subscribe so user-supplied prices flow through estimateCost on the next
+  // render. The ref itself is unused — the subscription is the point.
+  useCustomPricingStore((s) => s.pricings);
 
   if (loading) return <UsageSkeleton />;
   if (usage.length === 0) return <UsageEmpty />;
@@ -338,6 +344,7 @@ function HourlyTab({
 
 function EmptyChartState({ usage }: { usage: RuntimeUsage[] }) {
   const { t } = useT("runtimes");
+  const [dialogOpen, setDialogOpen] = useState(false);
   const hasTokens = usage.some(
     (u) =>
       u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens >
@@ -363,6 +370,20 @@ function EmptyChartState({ usage }: { usage: RuntimeUsage[] }) {
           <p className="text-[11px] text-muted-foreground/70">
             {t(($) => $.usage.empty_pricing_hint)}
           </p>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            className="mt-1"
+            onClick={() => setDialogOpen(true)}
+          >
+            {t(($) => $.usage.custom_pricing.open_button)}
+          </Button>
+          <CustomPricingDialog
+            open={dialogOpen}
+            onOpenChange={setDialogOpen}
+            unmappedModels={unmapped}
+          />
         </>
       ) : (
         <p className="text-xs text-muted-foreground">
