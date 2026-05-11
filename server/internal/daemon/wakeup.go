@@ -240,12 +240,15 @@ func marshalRaw(v any) json.RawMessage {
 // route it through the same self-heal entry point as the HTTP path and do
 // NOT record a heartbeat freshness mark — pretending the runtime is alive
 // would let HTTP keep skipping its own heartbeat against the dead UUID.
+//
+// handleRuntimeGone uses the daemon root context for its register call, so
+// this function can safely pass any caller context here.
 func (d *Daemon) handleWSHeartbeatAck(ctx context.Context, ack *HeartbeatResponse) {
 	if ack == nil || ack.RuntimeID == "" {
 		return
 	}
 	if ack.RuntimeGone {
-		go d.handleRuntimeGone(ctx, ack.RuntimeID)
+		go d.handleRuntimeGone(ack.RuntimeID)
 		return
 	}
 	d.recordWSHeartbeatAck(ack.RuntimeID)

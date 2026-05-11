@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -176,7 +177,7 @@ func TestHandleRuntimeGone_PrunesAndReregisters(t *testing.T) {
 	d.runtimeIndex["rt-old"] = Runtime{ID: "rt-old"}
 	d.wsHBLastAck["rt-old"] = time.Now()
 
-	d.handleRuntimeGone(context.Background(), "rt-old")
+	d.handleRuntimeGone("rt-old")
 
 	if got := d.runtimeIndex["rt-old"]; got.ID != "" {
 		t.Fatalf("rt-old still present in runtimeIndex: %+v", got)
@@ -215,7 +216,7 @@ func TestHandleRuntimeGone_CoalescesConcurrentCallers(t *testing.T) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			d.handleRuntimeGone(context.Background(), id)
+			d.handleRuntimeGone(id)
 		}(rid)
 	}
 	wg.Wait()
@@ -253,8 +254,8 @@ func TestHandleRuntimeGone_BackoffOnFailure(t *testing.T) {
 	d.runtimeIndex["rt-1"] = Runtime{ID: "rt-1"}
 	d.runtimeIndex["rt-2"] = Runtime{ID: "rt-2"}
 
-	d.handleRuntimeGone(context.Background(), "rt-1")
-	d.handleRuntimeGone(context.Background(), "rt-2")
+	d.handleRuntimeGone("rt-1")
+	d.handleRuntimeGone("rt-2")
 
 	if got := registerCount.Load(); got != 1 {
 		t.Fatalf("register endpoint called %d times on failure path, want 1 (second call should be coalesced)", got)
@@ -345,5 +346,307 @@ func TestWorkspaceNeedsRuntimeRecovery(t *testing.T) {
 	}
 	if d.workspaceNeedsRuntimeRecovery("ws-unknown") {
 		t.Fatalf("untracked workspace should NOT need recovery")
+	}
+}
+
+// multiProviderRegisterFixture mirrors handleRuntimeGoneFixture but speaks the
+// upsert semantics of UpsertAgentRuntime: surviving providers keep their
+// runtime IDs across re-registers, deleted ones get a fresh ID. The fake
+// server is the source of truth and rewrites its own knowledge of which
+// providers are alive each time a runtime is deleted.
+//
+// markDeleted(rid) emulates a UI Delete by removing the row server-side and
+// returning a brand-new ID for that provider on the next register call.
+type multiProviderRegisterFixture struct {
+	daemon        *Daemon
+	server        *httptest.Server
+	registerCount *atomic.Int64
+	mu            sync.Mutex
+	// providerToID maps provider -> current server-side runtime ID. The fake
+	// register handler reads/mutates this so the test reflects realistic
+	// upsert behavior.
+	providerToID map[string]string
+	idCounter    int
+}
+
+func newMultiProviderRegisterFixture(t *testing.T, providers map[string]string) *multiProviderRegisterFixture {
+	t.Helper()
+
+	fx := &multiProviderRegisterFixture{
+		providerToID: make(map[string]string, len(providers)),
+	}
+	for p, id := range providers {
+		fx.providerToID[p] = id
+	}
+
+	var registerCount atomic.Int64
+	fx.registerCount = &registerCount
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/daemon/register":
+			registerCount.Add(1)
+			fx.mu.Lock()
+			runtimes := make([]Runtime, 0, len(fx.providerToID))
+			for provider, id := range fx.providerToID {
+				if id == "" {
+					// Provider was marked deleted; mint a fresh ID
+					// (the UpsertAgentRuntime INSERT branch).
+					fx.idCounter++
+					id = fmt.Sprintf("%s-new-%d", provider, fx.idCounter)
+					fx.providerToID[provider] = id
+				}
+				runtimes = append(runtimes, Runtime{
+					ID: id, Name: provider, Provider: provider, Status: "online",
+				})
+			}
+			fx.mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(RegisterResponse{
+				Runtimes: runtimes,
+				Repos:    []RepoData{},
+			})
+		case strings.HasSuffix(r.URL.Path, "/recover-orphans"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	d := freshDaemon(srv.URL)
+	d.cfg.Agents = make(map[string]AgentEntry, len(providers))
+	for p := range providers {
+		d.cfg.Agents[p] = AgentEntry{Path: "/usr/bin/true"}
+	}
+	t.Cleanup(stubAgentVersion(t))
+	fx.daemon = d
+	fx.server = srv
+	return fx
+}
+
+// markDeleted simulates server-side runtime deletion: the next register call
+// will mint a new ID for this provider, matching the UI Delete + re-register
+// path's UpsertAgentRuntime INSERT branch.
+func (fx *multiProviderRegisterFixture) markDeleted(provider string) {
+	fx.mu.Lock()
+	defer fx.mu.Unlock()
+	fx.providerToID[provider] = ""
+}
+
+func TestHandleRuntimeGone_PartialWorkspaceRecoveryKeepsSibling(t *testing.T) {
+	// Workspace has two providers, only one runtime is deleted. The siblings
+	// must NOT end up duplicated in workspaceState.runtimeIDs — that would
+	// leak through allRuntimeIDs(), deregister(), and re-recovery state.
+	// This is the regression test for Finding #3 (register response is
+	// authoritative for the workspace's runtime set, not an append).
+	fx := newMultiProviderRegisterFixture(t, map[string]string{
+		"claude": "rt-claude-1",
+		"codex":  "rt-codex-1",
+	})
+	d := fx.daemon
+	d.workspaces["ws-1"] = &workspaceState{
+		workspaceID: "ws-1",
+		runtimeIDs:  []string{"rt-claude-1", "rt-codex-1"},
+	}
+	d.runtimeIndex["rt-claude-1"] = Runtime{ID: "rt-claude-1", Provider: "claude"}
+	d.runtimeIndex["rt-codex-1"] = Runtime{ID: "rt-codex-1", Provider: "codex"}
+
+	// Only the claude runtime gets deleted server-side.
+	fx.markDeleted("claude")
+	d.handleRuntimeGone("rt-claude-1")
+
+	got := append([]string(nil), d.workspaces["ws-1"].runtimeIDs...)
+	if len(got) != 2 {
+		t.Fatalf("workspace runtimeIDs has %d entries after partial recovery; want 2; got %v", len(got), got)
+	}
+	// Set comparison: must contain rt-codex-1 (surviving) and a freshly
+	// minted claude id, with NO duplicates.
+	seen := make(map[string]int, len(got))
+	for _, id := range got {
+		seen[id]++
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Fatalf("duplicate runtime id %q (count=%d) after partial recovery: %v", id, count, got)
+		}
+	}
+	if _, ok := seen["rt-codex-1"]; !ok {
+		t.Fatalf("surviving codex runtime missing from workspace state after recovery: %v", got)
+	}
+	if _, ok := seen["rt-claude-1"]; ok {
+		t.Fatalf("deleted claude runtime should not be in workspace state: %v", got)
+	}
+	// And the runtimeIndex must reflect the same: codex kept, claude-1 dropped.
+	if _, ok := d.runtimeIndex["rt-claude-1"]; ok {
+		t.Fatalf("rt-claude-1 still in runtimeIndex after deletion")
+	}
+	if _, ok := d.runtimeIndex["rt-codex-1"]; !ok {
+		t.Fatalf("rt-codex-1 dropped from runtimeIndex during partial recovery")
+	}
+}
+
+func TestHandleRuntimeGone_DistinctDeletionsWithinCoalesceWindowBothRecover(t *testing.T) {
+	// Two sequential, distinct runtime deletions in the same workspace fired
+	// within the 30s coalesce window. Each deletion must trigger its own
+	// re-register: success on call #1 must NOT suppress call #2. Regression
+	// for Finding #2 (success-case clear of reregisterNextAttempt).
+	fx := newMultiProviderRegisterFixture(t, map[string]string{
+		"claude": "rt-claude-1",
+		"codex":  "rt-codex-1",
+	})
+	d := fx.daemon
+	d.workspaces["ws-1"] = &workspaceState{
+		workspaceID: "ws-1",
+		runtimeIDs:  []string{"rt-claude-1", "rt-codex-1"},
+	}
+	d.runtimeIndex["rt-claude-1"] = Runtime{ID: "rt-claude-1", Provider: "claude"}
+	d.runtimeIndex["rt-codex-1"] = Runtime{ID: "rt-codex-1", Provider: "codex"}
+
+	// Sequential, NOT concurrent: the first call fully completes before the
+	// second starts, so the in-flight set never collides.
+	fx.markDeleted("claude")
+	d.handleRuntimeGone("rt-claude-1")
+
+	if got := fx.registerCount.Load(); got != 1 {
+		t.Fatalf("after first deletion: register called %d times, want 1", got)
+	}
+	// Inspect the new claude id the fake assigned, so we can detect that
+	// the second recovery actually ran register again.
+	fx.mu.Lock()
+	claudeIDAfterFirst := fx.providerToID["claude"]
+	fx.mu.Unlock()
+
+	// Now delete codex within the coalesce window (effectively t<1s after
+	// the first recovery), simulating a user deleting a second runtime
+	// shortly after the first.
+	fx.markDeleted("codex")
+	d.handleRuntimeGone("rt-codex-1")
+
+	if got := fx.registerCount.Load(); got != 2 {
+		t.Fatalf("after second distinct deletion: register called %d times, want 2 (coalesce window must clear on success)", got)
+	}
+	got := append([]string(nil), d.workspaces["ws-1"].runtimeIDs...)
+	if len(got) != 2 {
+		t.Fatalf("workspace runtimeIDs after both recoveries = %v, want 2 entries", got)
+	}
+	seen := make(map[string]int, len(got))
+	for _, id := range got {
+		seen[id]++
+	}
+	for id, count := range seen {
+		if count != 1 {
+			t.Fatalf("duplicate runtime id %q after sequential recoveries: %v", id, got)
+		}
+	}
+	if _, ok := seen[claudeIDAfterFirst]; !ok {
+		t.Fatalf("claude id from first recovery missing after second deletion of codex: have %v, expected to keep %q", got, claudeIDAfterFirst)
+	}
+}
+
+func TestHandleRuntimeGone_RecoveryContextSurvivesCallerCancellation(t *testing.T) {
+	// Regression for Finding #1: handleRuntimeGone must not use the per-
+	// runtime heartbeat ctx for the register HTTP call. notifyRuntimeSetChanged
+	// tears that ctx down as soon as we prune the dead runtime, so forwarding
+	// it would self-cancel the in-flight register.
+	//
+	// We assert by inspecting the register handler's request context: it
+	// must not be Done when the daemon's rootCtx is alive, regardless of what
+	// upstream contexts (heartbeat, poller, WS) are doing.
+	var observedCancelled atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/daemon/register" {
+			// Inspect the inbound request ctx. If handleRuntimeGone had
+			// forwarded a cancelled caller ctx, this would be Done.
+			select {
+			case <-r.Context().Done():
+				observedCancelled.Store(true)
+			default:
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(RegisterResponse{
+				Runtimes: []Runtime{{ID: "rt-new", Name: "claude", Provider: "claude", Status: "online"}},
+			})
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := freshDaemon(srv.URL)
+	d.cfg.Agents = map[string]AgentEntry{"claude": {Path: "/usr/bin/true"}}
+	t.Cleanup(stubAgentVersion(t))
+
+	// rootCtx is what handleRuntimeGone uses for recovery. We keep it alive.
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	defer rootCancel()
+	d.rootCtx = rootCtx
+
+	d.workspaces["ws-1"] = &workspaceState{workspaceID: "ws-1", runtimeIDs: []string{"rt-old"}}
+	d.runtimeIndex["rt-old"] = Runtime{ID: "rt-old"}
+
+	d.handleRuntimeGone("rt-old")
+
+	if observedCancelled.Load() {
+		t.Fatalf("register HTTP call ran with a cancelled context — recovery would self-cancel under runtime-set churn")
+	}
+	if got := d.workspaces["ws-1"].runtimeIDs; len(got) != 1 || got[0] != "rt-new" {
+		t.Fatalf("workspace runtimeIDs after recovery = %v, want [rt-new]", got)
+	}
+}
+
+func TestHandleRuntimeGone_RecoveryContextStopsOnDaemonShutdown(t *testing.T) {
+	// Companion to RecoveryContextSurvivesCallerCancellation: when the daemon
+	// IS shutting down, recovery must abort promptly instead of holding the
+	// HTTP call open until its 30s client timeout. We bound the server
+	// handler with a short safety timeout so test cleanup never hangs on a
+	// stuck connection — the assertion is on the daemon-side return time,
+	// not on server-side context propagation.
+	registerEntered := make(chan struct{}, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/daemon/register" {
+			select {
+			case registerEntered <- struct{}{}:
+			default:
+			}
+			select {
+			case <-r.Context().Done():
+			case <-time.After(2 * time.Second):
+			}
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := freshDaemon(srv.URL)
+	d.cfg.Agents = map[string]AgentEntry{"claude": {Path: "/usr/bin/true"}}
+	t.Cleanup(stubAgentVersion(t))
+
+	rootCtx, rootCancel := context.WithCancel(context.Background())
+	t.Cleanup(rootCancel)
+	d.rootCtx = rootCtx
+
+	d.workspaces["ws-1"] = &workspaceState{workspaceID: "ws-1", runtimeIDs: []string{"rt-old"}}
+	d.runtimeIndex["rt-old"] = Runtime{ID: "rt-old"}
+
+	done := make(chan struct{})
+	go func() {
+		d.handleRuntimeGone("rt-old")
+		close(done)
+	}()
+
+	select {
+	case <-registerEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("register endpoint was never reached")
+	}
+
+	rootCancel()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatalf("handleRuntimeGone did not abort after daemon root context cancellation")
 	}
 }

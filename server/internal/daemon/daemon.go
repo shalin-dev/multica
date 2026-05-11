@@ -91,6 +91,7 @@ type Daemon struct {
 	reregisterNextAttempt map[string]time.Time // workspace_id -> earliest time the next re-register attempt may run
 
 	cancelFunc    context.CancelFunc // set by Run(); called by triggerRestart
+	rootCtx       context.Context    // set by Run(); used by long-running recoveries that must survive per-runtime ctx cancellation
 	restartBinary string             // non-empty after a successful update; path to the new binary
 	updating      atomic.Bool        // prevents concurrent update attempts
 	activeTasks   atomic.Int64       // number of tasks currently in handleTask; exposed via /health
@@ -170,14 +171,22 @@ const reregisterFailureBackoff = 60 * time.Second
 //
 //   - keys an in-flight set on runtimeID to drop concurrent calls for the same
 //     ID after the first one is already cleaning up; and
-//   - keys a per-workspace next-attempt timestamp on workspaceID so the second
-//     stale runtime in the same workspace skips registerRuntimesForWorkspace
-//     when the first one's re-register is still inside the coalesce window.
+//   - keys a per-workspace next-attempt timestamp on workspaceID so that
+//     concurrent recoveries triggered by the SAME initial event coalesce to a
+//     single registerRuntimesForWorkspace call. The slot is cleared on success
+//     so a later distinct runtime deletion in the same workspace can trigger
+//     its own recovery without waiting for the coalesce window to expire.
 //
 // On failure of the underlying re-register, the next-attempt timestamp is
 // extended by reregisterFailureBackoff so we don't replace a server-side log
-// flood with a daemon-side register flood.
-func (d *Daemon) handleRuntimeGone(ctx context.Context, runtimeID string) {
+// flood with a daemon-side register flood. workspaceSyncLoop will retry
+// independently every DefaultWorkspaceSyncInterval as a safety net.
+//
+// The recovery HTTP call uses the daemon root context, not the caller's. The
+// heartbeat path's per-runtime ctx is cancelled by notifyRuntimeSetChanged the
+// moment we prune the dead UUID, and if we forwarded that ctx the in-flight
+// register would self-cancel mid-flight.
+func (d *Daemon) handleRuntimeGone(runtimeID string) {
 	if runtimeID == "" {
 		return
 	}
@@ -208,8 +217,11 @@ func (d *Daemon) handleRuntimeGone(ctx context.Context, runtimeID string) {
 	d.notifyRuntimeSetChanged()
 
 	// Per-workspace coalescing: claim the slot atomically. The first caller
-	// past this check is the only one that will run registerRuntimesForWorkspace
-	// for this workspace inside the coalesce window.
+	// past this check is the only one that will run
+	// registerRuntimesForWorkspace while the coalesce window is open. We
+	// clear the slot on success so a separate later deletion in the same
+	// workspace is NOT suppressed; the inflight set above is what keeps two
+	// callers from racing the same recovery.
 	now := time.Now()
 	d.runtimeGoneMu.Lock()
 	if next, ok := d.reregisterNextAttempt[workspaceID]; ok && now.Before(next) {
@@ -221,7 +233,7 @@ func (d *Daemon) handleRuntimeGone(ctx context.Context, runtimeID string) {
 	d.reregisterNextAttempt[workspaceID] = now.Add(reregisterCoalesceWindow)
 	d.runtimeGoneMu.Unlock()
 
-	if err := d.reregisterWorkspaceAfterRuntimeGone(ctx, workspaceID); err != nil {
+	if err := d.reregisterWorkspaceAfterRuntimeGone(d.recoveryContext(), workspaceID); err != nil {
 		d.runtimeGoneMu.Lock()
 		d.reregisterNextAttempt[workspaceID] = time.Now().Add(reregisterFailureBackoff)
 		d.runtimeGoneMu.Unlock()
@@ -230,7 +242,25 @@ func (d *Daemon) handleRuntimeGone(ctx context.Context, runtimeID string) {
 		// failure here is not a stuck state — just an extra wait.
 		d.logger.Warn("re-register after runtime gone failed",
 			"workspace_id", workspaceID, "error", err)
+		return
 	}
+	// Success: clear the coalesce slot so a future distinct runtime deletion
+	// in this workspace can trigger its own recovery immediately. The
+	// inflight set on runtimeID still prevents same-event stampedes.
+	d.runtimeGoneMu.Lock()
+	delete(d.reregisterNextAttempt, workspaceID)
+	d.runtimeGoneMu.Unlock()
+}
+
+// recoveryContext returns the daemon root context for long-running recovery
+// HTTP calls (re-register, recover-orphans) that must survive the heartbeat
+// loop tearing down a per-runtime context. Falls back to Background when the
+// daemon was not started via Run(), e.g. unit-test fixtures.
+func (d *Daemon) recoveryContext() context.Context {
+	if d.rootCtx != nil {
+		return d.rootCtx
+	}
+	return context.Background()
 }
 
 // removeStaleRuntime drops a runtime ID from its owning workspace's runtimeIDs
@@ -290,27 +320,51 @@ func (d *Daemon) workspaceNeedsRuntimeRecovery(workspaceID string) bool {
 }
 
 // reregisterWorkspaceAfterRuntimeGone calls registerRuntimesForWorkspace and
-// merges the resulting runtime IDs into the existing workspaceState. The
-// workspaceState pointer is NEVER replaced (see syncWorkspacesFromAPI's
-// invariant about repoRefreshMu).
+// updates the existing workspaceState in place. The register response is
+// authoritative for this workspace's runtime set — every configured provider
+// is included, with UpsertAgentRuntime returning the same row ID for surviving
+// providers and a fresh ID for any that were deleted server-side. Replacing
+// (rather than appending) is required: a partial recovery, where only one
+// runtime in a multi-provider workspace was deleted, would otherwise produce
+// duplicates for every provider that wasn't deleted.
+//
+// The workspaceState pointer is NEVER replaced (see syncWorkspacesFromAPI's
+// invariant about repoRefreshMu). Only fields are mutated.
 func (d *Daemon) reregisterWorkspaceAfterRuntimeGone(ctx context.Context, workspaceID string) error {
 	resp, err := d.registerRuntimesForWorkspace(ctx, workspaceID)
 	if err != nil {
 		return fmt.Errorf("register runtimes: %w", err)
 	}
 
-	runtimeIDs := make([]string, 0, len(resp.Runtimes))
+	newIDs := make([]string, 0, len(resp.Runtimes))
+	newIDSet := make(map[string]struct{}, len(resp.Runtimes))
+	for _, rt := range resp.Runtimes {
+		newIDs = append(newIDs, rt.ID)
+		newIDSet[rt.ID] = struct{}{}
+	}
+
 	d.mu.Lock()
 	ws, ok := d.workspaces[workspaceID]
 	if !ok {
 		d.mu.Unlock()
 		return fmt.Errorf("workspace %s no longer tracked", workspaceID)
 	}
+	// Drop runtimeIndex entries for prior runtime IDs that the server did not
+	// return — typically there are none for upsert-on-existing-provider, but
+	// a daemon config change (provider removed) would leak entries otherwise.
+	for _, oldID := range ws.runtimeIDs {
+		if _, kept := newIDSet[oldID]; !kept {
+			delete(d.runtimeIndex, oldID)
+		}
+	}
 	for _, rt := range resp.Runtimes {
 		d.runtimeIndex[rt.ID] = rt
-		runtimeIDs = append(runtimeIDs, rt.ID)
 	}
-	ws.runtimeIDs = append(ws.runtimeIDs, runtimeIDs...)
+	// Response is authoritative — replace, do not append. Replacing also
+	// catches the rare case where UpsertAgentRuntime returns a different ID
+	// for a surviving provider (e.g. schema change); the daemon converges on
+	// what the server says without leaving stale heartbeat goroutines.
+	ws.runtimeIDs = newIDs
 	if resp.ReposVersion != "" {
 		ws.reposVersion = resp.ReposVersion
 		ws.allowedRepoURLs = repoAllowlist(resp.Repos)
@@ -320,7 +374,7 @@ func (d *Daemon) reregisterWorkspaceAfterRuntimeGone(ctx context.Context, worksp
 	}
 	d.mu.Unlock()
 
-	for _, rid := range runtimeIDs {
+	for _, rid := range newIDs {
 		d.logger.Info("re-registered runtime after server-side deletion",
 			"workspace_id", workspaceID, "runtime_id", rid)
 	}
@@ -328,7 +382,7 @@ func (d *Daemon) reregisterWorkspaceAfterRuntimeGone(ctx context.Context, worksp
 
 	// Tell the server about any tasks the previous (now-deleted) runtime
 	// was working on, mirroring the registration path's recover-orphans call.
-	for _, rid := range runtimeIDs {
+	for _, rid := range newIDs {
 		if err := d.client.RecoverOrphans(ctx, rid); err != nil {
 			d.logger.Warn("recover-orphans after re-register failed",
 				"runtime_id", rid, "error", err)
@@ -431,6 +485,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Wrap context so handleUpdate can cancel the daemon for restart.
 	ctx, cancel := context.WithCancel(ctx)
 	d.cancelFunc = cancel
+	d.rootCtx = ctx
 
 	// Bind health port early to detect another running daemon.
 	healthLn, err := d.listenHealth()
@@ -1072,9 +1127,10 @@ func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) {
 			if isRuntimeNotFoundError(err) {
 				// Server says this runtime is gone — recover instead of
 				// looping on the dead UUID. handleRuntimeGone coalesces
-				// concurrent callers, so this is safe to call from every
-				// heartbeat tick.
-				go d.handleRuntimeGone(ctx, rid)
+				// concurrent callers and runs the recovery HTTP call under
+				// the daemon root context so notifyRuntimeSetChanged
+				// tearing down this heartbeat goroutine cannot abort it.
+				go d.handleRuntimeGone(rid)
 				return
 			}
 			d.logger.Warn("heartbeat failed", "runtime_id", rid, "error", err)
@@ -1085,7 +1141,7 @@ func (d *Daemon) runHeartbeatTick(ctx context.Context, rid string) {
 		// The WS path returns a successful ack with RuntimeGone=true for the
 		// same scenario; treat it the same way here in case HTTP starts
 		// surfacing this signal too.
-		go d.handleRuntimeGone(ctx, rid)
+		go d.handleRuntimeGone(rid)
 		return
 	}
 	d.handleHeartbeatActions(ctx, rid, resp)
@@ -1609,7 +1665,7 @@ func (d *Daemon) runRuntimePoller(
 					// the poller; the runtime-set watcher will tear this
 					// goroutine down via pollerCtx once the workspace is
 					// re-registered with a new runtime ID.
-					go d.handleRuntimeGone(parentCtx, rid)
+					go d.handleRuntimeGone(rid)
 					return
 				}
 				d.logger.Warn("claim task failed", "runtime_id", rid, "error", err)
