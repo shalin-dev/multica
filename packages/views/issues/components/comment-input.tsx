@@ -21,10 +21,13 @@ interface CommentInputProps {
 function CommentInput({ issueId, onSubmit }: CommentInputProps) {
   const { t } = useT("issues");
   const editorRef = useRef<ContentEditorRef>(null);
-  // Initial isEmpty reflects whether a hydrated draft has content; otherwise
-  // the submit button would be disabled even though the editor shows text.
-  const initialDraftPreview = useCommentDraftStore.getState().getDraft(`new:${issueId}`);
-  const [isEmpty, setIsEmpty] = useState(!initialDraftPreview?.trim());
+  // Read the persisted draft once on mount. ContentEditor only honors
+  // `defaultValue` at mount time, so this snapshot drives both the editor's
+  // initial content and the submit-button enable state — without this the
+  // button would be disabled even though the editor visibly contains text.
+  const draftKey = `new:${issueId}` as const;
+  const initialDraft = useCommentDraftStore.getState().getDraft(draftKey);
+  const [isEmpty, setIsEmpty] = useState(() => !initialDraft?.trim());
   const [submitting, setSubmitting] = useState(false);
   const [isExpanded, setIsExpanded] = useState(false);
   const uploadMapRef = useRef<Map<string, string>>(new Map());
@@ -33,12 +36,10 @@ function CommentInput({ issueId, onSubmit }: CommentInputProps) {
     onDrop: (files) => files.forEach((f) => editorRef.current?.uploadFile(f)),
   });
 
-  // Draft persistence. Hydrate from store on mount via `defaultValue`
+  // Draft persistence. Hydrate from store on mount via `defaultValue` above
   // (ContentEditorRef has no setContent, so this is the only injection point).
   // Flush on every onUpdate (debounced upstream) + visibilitychange/pagehide
   // so tab close / mobile background doesn't lose work. Cleared on submit.
-  const draftKey = `new:${issueId}` as const;
-  const initialDraft = useCommentDraftStore.getState().getDraft(draftKey);
   const setDraft = useCommentDraftStore((s) => s.setDraft);
   const clearDraft = useCommentDraftStore((s) => s.clearDraft);
   useEffect(() => {

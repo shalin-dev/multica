@@ -580,14 +580,30 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
     [timelineView.groups, expandedResolved],
   );
 
-  // Deep-link target index: when the inbox passes `highlightCommentId`, find
-  // its position in the flat list so Virtuoso can land on it initially via
-  // `initialTopMostItemIndex` (rough landing) and we can refine via imperative
-  // scrollToIndex in a useEffect (precision pass after ResizeObserver).
+  // Map of reply-comment id → root-comment id, so a deep-link to a reply
+  // (which lives inside a CommentCard, not in the flat items array) can fall
+  // back to scrolling the root thread into view. Without this, an inbox
+  // notification on a reply would land at items[-1] and short-circuit.
+  const replyToRoot = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const [rootId, replies] of timelineView.threadReplies) {
+      for (const reply of replies) {
+        map.set(reply.id, rootId);
+      }
+    }
+    return map;
+  }, [timelineView.threadReplies]);
+
+  // Deep-link target index in the flat items array. For root comments this is
+  // a direct findIndex hit; for reply ids we look up the enclosing root.
   const targetIdx = useMemo(() => {
     if (!highlightCommentId) return -1;
-    return items.findIndex((it) => it.id === highlightCommentId);
-  }, [items, highlightCommentId]);
+    const direct = items.findIndex((it) => it.id === highlightCommentId);
+    if (direct >= 0) return direct;
+    const rootId = replyToRoot.get(highlightCommentId);
+    if (!rootId) return -1;
+    return items.findIndex((it) => it.id === rootId);
+  }, [items, highlightCommentId, replyToRoot]);
 
   const {
     reactions: issueReactions,
@@ -666,25 +682,94 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
   useEffect(() => {
     if (!highlightCommentId || items.length === 0 || targetIdx < 0) return;
     if (didHighlightRef.current === highlightCommentId) return;
-    didHighlightRef.current = highlightCommentId;
-    let inner = 0;
-    const outer = requestAnimationFrame(() => {
-      inner = requestAnimationFrame(() => {
-        virtuosoRef.current?.scrollToIndex({
-          index: targetIdx,
-          align: "center",
-          behavior: "auto",
-        });
-        setHighlightedId(highlightCommentId);
-      });
-    });
-    const timer = setTimeout(() => setHighlightedId(null), 3000);
-    return () => {
-      cancelAnimationFrame(outer);
-      cancelAnimationFrame(inner);
-      clearTimeout(timer);
+
+    // Strategy: Virtuoso's scrollToIndex is asynchronous — it queues an
+    // internal state change that mounts the target a few frames later. The
+    // target also isn't in the DOM until Virtuoso settles. So:
+    //   1. Kick off Virtuoso to start moving toward the target
+    //   2. Poll for the target's DOM element (max ~20 frames ≈ 320ms)
+    //   3. Once found, use the browser's scrollIntoView which correctly
+    //      accounts for all sibling content above the list
+    //   4. After Virtuoso fully settles, scrollIntoView one more time —
+    //      Virtuoso may have overwritten our scroll position
+    const rafIds: number[] = [];
+    const timeoutIds: number[] = [];
+    const cancelled = { value: false };
+
+    const findTarget = () => {
+      // First try the exact id — works for root comments and for replies
+      // whose enclosing thread is currently expanded.
+      const direct = scrollContainerEl?.querySelector(
+        `[data-comment-id="${CSS.escape(highlightCommentId)}"]`,
+      ) as HTMLElement | null;
+      if (direct) return direct;
+      // Reply in a collapsed thread: fall back to the root wrapper so we at
+      // least scroll the card containing the target into view.
+      const rootId = replyToRoot.get(highlightCommentId);
+      if (rootId) {
+        return scrollContainerEl?.querySelector(
+          `[data-comment-id="${CSS.escape(rootId)}"]`,
+        ) as HTMLElement | null;
+      }
+      return null;
     };
-  }, [highlightCommentId, items.length, targetIdx]);
+
+    const performScroll = () => {
+      const el = findTarget();
+      if (!el) return false;
+      el.scrollIntoView({ block: "center", behavior: "auto" });
+      return true;
+    };
+
+    const pollMount = (attemptsLeft: number) => {
+      if (cancelled.value) return;
+      if (performScroll()) {
+        setHighlightedId(highlightCommentId);
+        didHighlightRef.current = highlightCommentId;
+        // Done. No reanchor — polling already waits until Virtuoso has
+        // settled enough to mount the target, so scrollIntoView IS the
+        // last write. Adding a delayed re-scroll would yank the user back
+        // if they scrolled away in the meantime.
+        return;
+      }
+      if (attemptsLeft <= 0) {
+        // Virtuoso didn't mount the target within ~320ms. Still set the
+        // highlight so when the user manually scrolls there, the card
+        // flashes. Mark handled so subsequent renders don't keep polling.
+        // eslint-disable-next-line no-console
+        console.warn(
+          `[deep-link] target ${highlightCommentId} did not mount in time; highlight set without scroll`,
+        );
+        setHighlightedId(highlightCommentId);
+        didHighlightRef.current = highlightCommentId;
+        return;
+      }
+      const id = requestAnimationFrame(() => pollMount(attemptsLeft - 1));
+      rafIds.push(id);
+    };
+
+    const start = requestAnimationFrame(() => {
+      if (cancelled.value) return;
+      // Step 1: kick Virtuoso so it begins mounting target index.
+      virtuosoRef.current?.scrollToIndex({
+        index: targetIdx,
+        align: "center",
+        behavior: "auto",
+      });
+      // Step 2-4: start polling for the DOM element.
+      pollMount(20);
+    });
+    rafIds.push(start);
+
+    const flash = window.setTimeout(() => setHighlightedId(null), 2000);
+    timeoutIds.push(flash);
+
+    return () => {
+      cancelled.value = true;
+      for (const id of rafIds) cancelAnimationFrame(id);
+      for (const id of timeoutIds) clearTimeout(id);
+    };
+  }, [highlightCommentId, items.length, targetIdx, scrollContainerEl]);
 
   // Cmd-F / Ctrl-F on a virtualized timeline only searches what's mounted in
   // the viewport — off-screen comments are invisible to browser find-in-page.
@@ -1307,28 +1392,31 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                   ref={virtuosoRef}
                   customScrollParent={scrollContainerEl}
                   data={items}
-                  defaultItemHeight={120}
                   increaseViewportBy={{ top: 800, bottom: 800 }}
                   computeItemKey={(_i, item) => `${item.kind}:${item.id}`}
                   skipAnimationFrameInResizeObserver
-                  // followOutput="auto": only stick to bottom when the user is
-                  // already there. If they scrolled up to read history, a new
-                  // WS comment won't yank them back down. Matches Slack/Discord.
-                  followOutput="auto"
-                  // Default to index 0 (top) when there's no deep-link target,
-                  // so the surrounding page scrolls naturally from the top
-                  // and the user sees title/description first, like the
-                  // original .map. Do NOT use `undefined` here — Virtuoso
-                  // reads .align off the prop directly and crashes on undefined.
-                  initialTopMostItemIndex={
-                    targetIdx >= 0
-                      ? { index: targetIdx, align: "center" }
-                      : 0
-                  }
+                  // followOutput intentionally NOT set. Virtuoso treats it as
+                  // a sticky "is at bottom" flag and resets scrollTop to
+                  // maxScrollTop on every ResizeObserver / height-change tick
+                  // — this is what was yanking the user back to scrollTop=299
+                  // whenever they tried to scroll up after a deep-link
+                  // landed on the last item. Issue-detail is document-shaped
+                  // (not a chat), so auto-follow on new comments is not
+                  // critical; users can scroll to bottom themselves.
+                  // Intentionally NOT passing `initialTopMostItemIndex`.
+                  // In customScrollParent mode Virtuoso treats this prop as
+                  // a persistent anchor and resets scrollTop whenever the
+                  // list height changes (ResizeObserver firing on real-card
+                  // measurement, etc.) — which fights against the user when
+                  // they scroll up. Deep-link landing is handled imperatively
+                  // by the useEffect above (scrollToIndex + scrollIntoView).
                   itemContent={(_i, item) => {
                     if (item.kind === "resolved-bar") {
                       return (
-                        <div className="pb-3">
+                        // data-comment-id is the anchor for inbox deep-link;
+                        // see the deep-link useEffect for how scrollIntoView
+                        // finds it after Virtuoso mounts the item.
+                        <div className="pb-3" data-comment-id={item.id}>
                           <ResolvedThreadBar
                             entry={item.entry}
                             replies={timelineView.threadReplies.get(item.id) ?? EMPTY_REPLIES}
@@ -1340,7 +1428,7 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
                     if (item.kind === "comment") {
                       const isResolved = !!item.entry.resolved_at;
                       return (
-                        <div className="pb-3">
+                        <div className="pb-3" data-comment-id={item.id}>
                           <CommentCard
                             issueId={id}
                             entry={item.entry}
@@ -1418,7 +1506,12 @@ export function IssueDetail({ issueId, onDelete, onDone, defaultSidebarOpen = tr
 
             {/* Bottom comment input — no avatar, full width */}
             <div className="mt-4">
-              <CommentInput issueId={id} onSubmit={submitComment} />
+              {/* key={id}: web's /issues/[id] route doesn't remount on
+                  issueId change, so without an explicit key the editor
+                  keeps the previous issue's in-memory content and the
+                  next keystroke would flush it into the new issue's
+                  draft key. */}
+              <CommentInput key={id} issueId={id} onSubmit={submitComment} />
             </div>
           </div>
         </div>
