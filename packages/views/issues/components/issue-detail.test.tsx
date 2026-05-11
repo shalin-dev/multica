@@ -264,6 +264,39 @@ vi.mock("@multica/core/issues/stores", () => ({
     };
     return selector ? selector(state) : state;
   },
+  useCommentDraftStore: Object.assign(
+    (selector?: any) => {
+      const state = {
+        drafts: {} as Record<string, { content: string; updatedAt: number }>,
+        getDraft: () => undefined,
+        setDraft: () => {},
+        clearDraft: () => {},
+      };
+      return selector ? selector(state) : state;
+    },
+    {
+      getState: () => ({
+        drafts: {} as Record<string, { content: string; updatedAt: number }>,
+        getDraft: () => undefined,
+        setDraft: () => {},
+        clearDraft: () => {},
+      }),
+    },
+  ),
+}));
+
+// Mock react-virtuoso: jsdom has no real layout, so the real Virtuoso would
+// compute a 0-height viewport and render nothing. The mock renders every item
+// inline, which matches how the unvirtualized .map used to behave and keeps
+// existing assertions (`getByText('Started working on this')` etc.) working.
+vi.mock("react-virtuoso", () => ({
+  Virtuoso: ({ data, itemContent }: { data: unknown[]; itemContent: (i: number, item: unknown) => unknown }) => (
+    <div data-testid="virtuoso-mock">
+      {data.map((item, i) => (
+        <div key={i}>{itemContent(i, item) as React.ReactElement}</div>
+      ))}
+    </div>
+  ),
 }));
 
 // Mock modals
