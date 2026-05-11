@@ -214,6 +214,17 @@ if (is.dev) {
   app.setPath("userData", join(app.getPath("appData"), DEV_APP_NAME));
 }
 
+// Linux production: set a clean app name so Electron emits "Multica" as
+// WM_CLASS instead of deriving it from the scoped npm package name
+// (@multica/desktop). WM_CLASS mismatch with the .desktop entry's
+// StartupWMClass prevents GNOME/KDE/Deepin from associating the running
+// window with the .desktop file, which breaks icon display and taskbar
+// pinning. macOS and dev builds are unaffected (macOS uses Info.plist,
+// dev already has app.setName above).
+if (!is.dev && process.platform === "linux") {
+  app.setName("Multica");
+}
+
 // --- Protocol registration -----------------------------------------------
 
 if (process.defaultApp) {

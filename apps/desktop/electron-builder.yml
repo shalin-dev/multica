@@ -46,6 +46,14 @@ linux:
   # Yaru). Forcing `multica` makes every Linux identity slot agree and
   # matches `StartupWMClass=Multica` (productName-derived).
   executableName: multica
+  # Explicit icon path prevents electron-builder from deriving the icon name
+  # from the scoped npm package name (@multica/desktop → @multicadesktop),
+  # which would produce an Icon=@multicadesktop entry in the .desktop file
+  # and install icons under /usr/share/icons/hicolor/*/apps/@multicadesktop.png.
+  # The leading @ violates the freedesktop icon naming spec, causing GNOME/
+  # KDE/Deepin to fail resolving the icon. resources/icon.png is the same
+  # 1024x1024 PNG used by the BrowserWindow icon option in createWindow().
+  icon: resources/icon.png
   # Pin StartupWMClass explicitly to the WM_CLASS that Electron emits on
   # X11. Electron derives WM_CLASS from `app.getName()`, which in packaged
   # builds resolves to `productName` (`Multica`). Without an explicit
